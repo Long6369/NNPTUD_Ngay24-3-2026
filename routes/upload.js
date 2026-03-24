@@ -9,6 +9,11 @@ let productsModel = require('../schemas/products')
 let inventoryModel = require('../schemas/inventories')
 let mongoose = require('mongoose')
 let slugify = require('slugify')
+let crypto = require('crypto')
+let userController = require('../controllers/users')
+let cartModel = require('../schemas/carts')
+let roleModel = require('../schemas/roles')
+let { sendPasswordMail } = require('../utils/sendMail')
 
 router.post('/one_image', uploadImage.single('file'), function (req, res, next) {
     if (!req.file) {
@@ -152,6 +157,99 @@ router.post('/excel', uploadExcel.single('file'), async function (req, res, next
             }
         }))
     }
+})
+
+router.post('/excel_users', uploadExcel.single('file'), async function (req, res, next) {
+    if (!req.file) {
+        return res.status(404).send({ message: "file not found" })
+    }
+
+    let workbook = new exceljs.Workbook();
+    let pathFile = path.join(__dirname, '../uploads', req.file.filename)
+    await workbook.xlsx.readFile(pathFile)
+    let worksheet = workbook.worksheets[0];
+    let result = []
+
+    // Tim role "user"
+    let userRole = await roleModel.findOne({ name: 'user', isDeleted: false })
+    if (!userRole) {
+        fs.unlinkSync(pathFile)
+        return res.status(404).send({ message: "Role 'user' khong ton tai" })
+    }
+
+    // Lay danh sach username va email da ton tai
+    let existingUsers = await require('../schemas/users').find({})
+    let existingUsernames = existingUsers.map(u => u.username)
+    let existingEmails = existingUsers.map(u => u.email)
+
+    for (let index = 2; index <= worksheet.rowCount; index++) {
+        let errorsInRow = []
+        const row = worksheet.getRow(index);
+        let username = row.getCell(1).value;
+        let email = row.getCell(2).value;
+
+        if (!username || String(username).trim() === '') {
+            errorsInRow.push('username khong duoc rong')
+        }
+        if (!email || String(email).trim() === '') {
+            errorsInRow.push('email khong duoc rong')
+        }
+        if (existingUsernames.includes(String(username))) {
+            errorsInRow.push('username da ton tai')
+        }
+        if (existingEmails.includes(String(email).toLowerCase())) {
+            errorsInRow.push('email da ton tai')
+        }
+
+        if (errorsInRow.length > 0) {
+            result.push({ success: false, data: errorsInRow })
+            continue;
+        }
+
+        // Random password 16 ky tu
+        let password = crypto.randomBytes(8).toString('hex'); // 16 hex chars
+
+        let session = await mongoose.startSession();
+        session.startTransaction()
+        try {
+            let newUser = await userController.CreateAnUser(
+                String(username), password, String(email),
+                userRole._id, session
+            )
+            let newCart = new cartModel({ user: newUser._id })
+            await newCart.save({ session })
+
+            await session.commitTransaction()
+            await session.endSession()
+
+            existingUsernames.push(String(username))
+            existingEmails.push(String(email).toLowerCase())
+
+            // Gui email password cho user
+            await sendPasswordMail(String(email), String(username), password)
+
+            result.push({
+                success: true,
+                data: { username: String(username), email: String(email) }
+            })
+        } catch (error) {
+            await session.abortTransaction()
+            await session.endSession()
+            result.push({ success: false, data: error.message })
+        }
+    }
+
+    fs.unlinkSync(pathFile)
+    res.send(result.map(function (r, index) {
+        if (r.success) {
+            return { [index + 1]: r.data }
+        } else {
+            if (Array.isArray(r.data)) {
+                return { [index + 1]: r.data.join(',') }
+            }
+            return { [index + 1]: r.data }
+        }
+    }))
 })
 
 module.exports = router;
